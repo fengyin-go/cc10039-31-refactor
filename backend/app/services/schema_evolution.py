@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.version_reference import check_version_reference
 from app.store import store
 
 
@@ -30,7 +31,7 @@ class SchemaEvolutionService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     def submit_approval(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
-        """提交审批：执行兼容性检查。"""
+        """提交审批：执行兼容性检查并核对变更前快照的版本引用。"""
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, "Schema 变更不存在"
@@ -49,12 +50,31 @@ class SchemaEvolutionService(BaseModuleService):
                 f"允许的操作：{'、'.join(allowed) if allowed else '无'}",
             )
 
-        # 检查变更前快照是否可用
+        # 检查变更前快照是否可用：锁外先做一次只读核对，快速失败
         snapshot_ref = entry.get("变更前快照", "")
         if snapshot_ref:
-            snapshots = store.find_by_field("snapshot_version", "版本号", snapshot_ref)
-            available = [s for s in snapshots if s.get("status") == "可用"]
-            if not available:
+            check = check_version_reference(snapshot_ref)
+            if not check.available:
+                return None, f"变更前快照 {snapshot_ref} 不可用"
+
+        # 锁内复查同一份版本引用核对结果后再写入，防止并发废弃造成
+        # "已提交但无法读取"的悬空审批引用
+        with store.transaction():
+            current = store.find(self.MODULE, entry_id)
+            if current is None or current.get("status") != "草稿":
+                return None, "Schema 变更状态已变化，提交审批失败"
+            return self._finalize_submission(current, entry_id, change_type, compat_level)
+
+    def _finalize_submission(
+        self, entry: dict[str, Any], entry_id: int,
+        change_type: str, compat_level: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """在临界区内完成审批提交的状态流转与事件记录。"""
+        snapshot_ref = entry.get("变更前快照", "")
+        if snapshot_ref:
+            # 锁内复查版本引用核对结果，确认快照仍可用
+            check = check_version_reference(snapshot_ref)
+            if not check.available:
                 return None, f"变更前快照 {snapshot_ref} 不可用"
 
         entry["status"] = "待审批"

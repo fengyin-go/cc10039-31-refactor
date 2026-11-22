@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import copy
 import datetime
-from typing import Any
+import threading
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from app.seed import SEED_ROWS
 
@@ -21,6 +23,19 @@ class Store:
         self._events: list[dict[str, Any]] = []
         # 模块快照备份：用于检查点和恢复
         self._snapshots: dict[str, list[dict[str, Any]]] = {}
+        # 跨模块写操作的互斥锁：保证"核对 + 写入"原子完成，避免并发
+        # 操作各自先查一次都获准、随后留下彼此不一致的关联记录。
+        # 可重入，允许同一线程在临界区内嵌套调用。
+        self._lock = threading.RLock()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """跨模块写操作临界区：核对结果与状态流转在同一把锁内完成。"""
+        self._lock.acquire()
+        try:
+            yield
+        finally:
+            self._lock.release()
 
     # ---- 基础读写 ----
 

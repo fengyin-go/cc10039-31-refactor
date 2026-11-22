@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.version_reference import check_version_reference
 from app.store import store
 
 
@@ -60,7 +61,7 @@ class SnapshotVersionService(BaseModuleService):
         return entry, f"湖表 {table_name} 版本 {version_no} 快照已生成，key={snapshot_key}"
 
     def discard_snapshot(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
-        """废弃快照版本：检查是否有后续快照依赖。"""
+        """废弃快照版本：通过版本引用核对检查待处理依赖。"""
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, "快照版本不存在"
@@ -70,23 +71,41 @@ class SnapshotVersionService(BaseModuleService):
         table_name = entry.get("湖表名", "")
         version_no = entry.get("版本号", "")
 
-        # 检查 schema 演进是否引用了此版本
-        schema_changes = store.find_by_field("schema_evolution", "变更前快照", version_no)
-        pending_changes = [sc for sc in schema_changes if sc.get("status") in ("草稿", "待审批")]
-        if pending_changes:
-            return None, f"版本 {version_no} 仍被 {len(pending_changes)} 个待处理 Schema 变更引用，不可废弃"
+        # 锁外先消费一次版本引用核对结果，快速失败
+        check = check_version_reference(version_no, table_name)
+        if check.pending_references:
+            return None, (
+                f"版本 {version_no} 仍被 {check.pending_reference_count} 个"
+                f"待处理 Schema 变更引用，不可废弃"
+            )
 
-        entry["status"] = "已废弃"
-        entry["pending"] = False
-        entry["abnormal"] = False
+        # 锁内复查同一份核对结果后再写入，防止并发提交审批造成
+        # 快照已废弃而审批仍引用该版本的不一致结果
+        with store.transaction():
+            current = store.find(self.MODULE, entry_id)
+            if current is None or current.get("status") != "可用":
+                return None, "快照版本状态已变化，不可废弃"
 
-        store.log_event("snapshot_discarded", "snapshot_version", "schema_evolution", {
-            "snapshot_id": entry_id,
-            "table_name": table_name,
-            "version_no": version_no,
-        })
+            recheck = check_version_reference(
+                current.get("版本号", ""), current.get("湖表名", "")
+            )
+            if recheck.pending_references:
+                return None, (
+                    f"版本 {recheck.version_no} 仍被 {recheck.pending_reference_count} 个"
+                    f"待处理 Schema 变更引用，不可废弃"
+                )
 
-        return entry, f"快照版本 {version_no} 已废弃"
+            current["status"] = "已废弃"
+            current["pending"] = False
+            current["abnormal"] = False
+
+            store.log_event("snapshot_discarded", "snapshot_version", "schema_evolution", {
+                "snapshot_id": entry_id,
+                "table_name": current.get("湖表名", ""),
+                "version_no": current.get("版本号", ""),
+            })
+
+            return current, f"快照版本 {current.get('版本号', '')} 已废弃"
 
     def available_snapshots_for_table(self, table_name: str) -> list[dict[str, Any]]:
         """查询指定湖表的可用快照列表。"""
